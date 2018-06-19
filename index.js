@@ -139,10 +139,6 @@ Protos.prototype.parseFile = function(data, callback) {
             callback(err);
         }
         else {
-            self.logger.info("initPayload");
-            self.logger.info(initPayload);
-            self.logger.info("tdPayload");
-            self.logger.info(tdPayload);
             callback();
         }
     });
@@ -155,8 +151,6 @@ Protos.prototype.readTCSection = function(data, offset, callback) {
     var charInt;
     do {
         charInt = data[offset++];
-        self.logger.info(charInt);
-        self.logger.info(String.fromCharCode(charInt));
         if(_.isUndefined(charInt)) {
             callback(new Error("Unable to read payload size"));
             return;
@@ -166,10 +160,7 @@ Protos.prototype.readTCSection = function(data, offset, callback) {
             sizeString += char;
         }
     } while(charInt !== 32);
-    self.logger.info("Blah");
-    self.logger.info(sizeString);
     if(/^[0-9]*$/.test(sizeString)) {
-        self.logger.info("Blah2");
         var size = parseInt(sizeString, 10);
         if(size+offset>data.length) {
             callback(new Error("Reported size is greater than data in file"));
