@@ -15,5 +15,10 @@
   "bugs": {
     "url": "https://github.com/meuserj/node-sip-protos/issues"
   },
-  "homepage": "https://github.com/meuserj/node-sip-protos#readme"
+  "homepage": "https://github.com/meuserj/node-sip-protos#readme",
+  "dependencies": {
+    "async": "^2.6.1",
+    "cli": "^1.0.1",
+    "lodash": "^4.17.10"
+  }
 }
