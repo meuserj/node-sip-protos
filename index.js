@@ -3,6 +3,9 @@ var _ = require('lodash');
 var fs = require('fs');
 var path = require('path');
 var async = require('async');
+var ip = require('ip');
+var dns = require('dns');
+var uuid = require('node-uuid');
 module.exports = Protos;
 
 function Protos(options, logger) {
@@ -41,7 +44,6 @@ Protos.options = {
     touri:      ['t', "Recipient of the request", "string"],
     fromuri:    ['f', "Initiator of the request", "string"],
     sendto:     ['s', "Send packets to domain instead of domain name of -touri", "string"],
-    callid:     ['c', "Call id to start test-case call ids from", "string", "0"],
     dport:      ['p', "Portnumber to send packets on host.", "int", 5060],
     lport:      ['l', "Portnumber to send packets from.", "int", 5060],
     delay:      ['d', "Time in ms to wait before sending new test-case", "int", 100],
@@ -88,42 +90,58 @@ Protos.lastTestCase = function() {
 
 Protos.prototype.run = function() {
     var self = this;
-    if(_.isString(self.file)) {
-        self.runSingleTestSuite(self.file, function(err) {
-            if(err) {
-                self.logger.error(err);
+    self.generateReplacements(function(err, replacements) {
+        if(err) {
+            self.logger.error(err);
+        }
+        else {
+            self.logger.info(JSON.stringify(replacements, undefined, 2));
+            self.replacements = replacements;
+            if(_.isString(self.file)) {
+                self.runSingleTestSuite(self.file, function(err) {
+                    if(err) {
+                        self.logger.error(err);
+                    }
+                });
             }
-        });
-    }
-    else {
-        async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
-            var filename = 'testcases/'+(('0000000'+idx).slice(-7));
-            self.runSingleTestSuite(filename, function(err) {
-                if(err) {
-                    self.logger.error(err);
-                }
-                callback();
-            });
-        },
-        function(err, results) {
-        });
-    }
+            else {
+                async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
+                    var filename = 'testcases/'+(('0000000'+idx).slice(-7));
+                    self.runSingleTestSuite(filename, function(err) {
+                        if(err) {
+                            self.logger.error(err);
+                        }
+                        callback();
+                    });
+                },
+                function(err, results) {
+                });
+            }
+        }
+    });
 };
 
 Protos.prototype.runSingleTestSuite = function(file, callback) {
     var self = this;
     var tasks = [];
     tasks.push(function(callback) {
-        self.logger.info(file);
         fs.readFile(file, callback);
     });
     tasks.push(function(data, callback) {
-        self.parseFile(data, callback);
+        self.readTC(data, callback);
+    });
+    tasks.push(function(initPayload, tdPayload, callback) {
+        self.applyReplacements(initPayload, tdPayload, callback);
+    });
+    tasks.push(function(initPayload, tdPayload, callback) {
+        self.logger.info("\n"+initPayload);
+        self.logger.info("\n"+tdPayload);
+        callback();
     });
     async.waterfall(tasks, callback);
 };
 
-Protos.prototype.parseFile = function(data, callback) {
+Protos.prototype.readTC = function(data, callback) {
     var self = this;
     var tasks = [];
     tasks.push(function(callback) {
@@ -134,14 +152,7 @@ Protos.prototype.parseFile = function(data, callback) {
             callback(err, initPayload, tdPayload);
         });
     });
-    async.waterfall(tasks, function(err, initPayload, tdPayload) {
-        if(err) {
-            callback(err);
-        }
-        else {
-            callback();
-        }
-    });
+    async.waterfall(tasks, callback);
 };
 
 Protos.prototype.readTCSection = function(data, offset, callback) {
@@ -169,7 +180,146 @@ Protos.prototype.readTCSection = function(data, offset, callback) {
         else {
             var payloadBuf = Buffer.alloc(size);
             data.copy(payloadBuf, 0, offset, size+offset);
-            callback(undefined, payloadBuf.toString(), size+offset);
+            callback(undefined, payloadBuf.toString().trim(), size+offset);
         }
     }
+};
+
+Protos.prototype.applyReplacements = function(initPayload, tdPayload, callback) {
+    var self = this;
+    var tasks = [];
+    tasks.push(function(callback) {
+        async.eachOfSeries(self.replacements, function(val, key, callback) {
+            initPayload = initPayload.replace(new RegExp('<'+key+'>', 'gm'), val);
+            tdPayload = tdPayload.replace(new RegExp('<'+key+'>', 'gm'), val);
+            callback();
+        },
+        function() {
+            callback();
+        });
+    });
+    tasks.push(function(callback) {
+        var callId  = uuid.v4();
+        var branchId = callId.replace(/-/g, '');
+        initPayload = initPayload.replace(new RegExp('<Call-ID>', 'gm'), callId);
+        tdPayload   = tdPayload.replace(new RegExp('<Call-ID>', 'gm'), callId);
+        initPayload = initPayload.replace(new RegExp('<CSeq>', 'gm'), 1);
+        tdPayload   = tdPayload.replace(new RegExp('<CSeq>', 'gm'), 2);
+        initPayload = initPayload.replace(new RegExp('branch=z9hG4bK.*<Branch-ID>', 'gm'), 'branch=z9hG4bK'+branchId);
+        tdPayload   = tdPayload.replace(new RegExp('branch=z9hG4bK.*<Branch-ID>', 'gm'), 'branch=z9hG4bK'+branchId);
+        if(/<Content-Length>/.test(initPayload)) {
+            var initSize = Protos.calcSize(initPayload);
+            initPayload = initPayload.replace(new RegExp('<Content-Length>', 'gm'), initSize);
+        }
+        if(/<Content-Length>/.test(tdPayload)) {
+            var tdSize = Protos.calcSize(tdPayload);
+            tdPayload = tdPayload.replace(new RegExp('<Content-Length>', 'gm'), tdSize);
+        }
+        callback();
+    });
+    async.series(tasks, function(err) {
+        callback(err, initPayload, tdPayload);
+    });
+};
+
+Protos.prototype.generateReplacements = function(callback) {
+    var self = this;
+    var tasks = [];
+    var replacements = {};
+    var addrRegex = /^(?:([A-z0-9+_-]*)(?::([^@]*))?@)?([0-9A-z._-]*)(?::([0-9])*)?/;
+    tasks.push(function(callback) {
+        if(_.isString(self.touri)) {
+            if(addrRegex.test(self.touri)) {
+                var parsedToURI = self.touri.match(addrRegex);
+                replacements.To = self.touri;
+                replacements["To-User"] = parsedToURI[1];
+                replacements["To-Pass"] = parsedToURI[2];
+                replacements["To-Host"] = parsedToURI[3];
+                replacements["To-Port"] = parsedToURI[4];
+                if(/^[0-9]*$/.test(replacements["To-Port"])) {
+                    self.dport = parseInt(replacements["To-Port"], 10);
+                }
+                callback();
+            }
+            else {
+                callback(new Error("Could not parse touri value"));
+            }
+        }
+    });
+    tasks.push(function(callback) {
+        if(_.isString(self.fromuri)) {
+            if(addrRegex.test(self.fromuri)) {
+                var parsedFromURI = self.fromuri.match(addrRegex);
+                replacements.From = self.fromuri;
+                replacements["From-User"] = parsedFromURI[1];
+                replacements["From-Pass"] = parsedFromURI[2];
+                replacements["From-Host"] = parsedFromURI[3];
+                replacements["From-Port"] = parsedFromURI[4];
+                replacements["From-Address"] = parsedFromURI[3];
+                if(/^[0-9]*$/.test(replacements["From-Port"])) {
+                    self.lport = parseInt(replacements["From-Port"], 10);
+                }
+                callback();
+            }
+            else {
+                callback(new Error("Could not parse fromuri value"));
+            }
+        }
+        else {
+            replacements["From-IP"] = ip.address();
+            replacements["From-Address"] = ip.address();
+            replacements.From = "user@"+ip.address();
+            callback();
+        }
+    });
+    tasks.push(function(callback) {
+        if(!ip.isV4Format(replacements["From-Address"]) && !ip.isV4Format(replacements["From-Address"])) {
+            dns.resolve4(replacements["From-Address"], function(err, ips) {
+                if(err) {
+                    callback(err);
+                }
+                else if(_.isString(ips) || (_.isArray(ips) && _.isString(_.last(ips)))) {
+                    if(_.isArray(ips)) {
+                        ips = _.last(ips);
+                    }
+                    if(ip.isV4Format(ips)) {
+                        replacements["From-IP"] = ips;
+                        callback();
+                    }
+                    else {
+                        callback(new Error("Could not resolve From IP"));
+                    }
+                }
+                else {
+                    callback(new Error("Could not resolve From IP"));
+                }
+            });
+        }
+        else {
+            replacements["From-IP"] = replacements["From-Address"];
+            callback();
+        }
+    });
+    tasks.push(function(callback) {
+        replacements["Teardown-Method"] = "CANCEL";
+        replacements["Local-Port"] = self.lport;
+        callback();
+    });
+    async.series(tasks, function(err) {
+        callback(err, replacements);
+    });
+};
+
+Protos.calcSize = function(msg) {
+    var msgArr = msg.split('\r\n');
+    var startIdx = msgArr.indexOf("");
+    if(startIdx < 0) {
+        return 0;
+    }
+    else {
+        var contentArr = msgArr.slice(startIdx);
+        var size = contentArr.join('\r\n').length;
+        return size;
+    }
+    return 0;
 };
