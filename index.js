@@ -7,6 +7,8 @@ var ip = require('ip');
 var dns = require('dns');
 var uuid = require('node-uuid');
 var dgram = require('dgram');
+var cb = require('cb');
+var hexdump = require('@buzuli/hexdump');
 module.exports = Protos;
 
 function Protos(options, logger) {
@@ -32,12 +34,15 @@ function Protos(options, logger) {
     }
     events.EventEmitter.call(this);
     self.on('message', function(message, remote) {
+        if(self.showreply) {
+            self.logger.info('\n'+hexdump(message));
+        }
         self.logger.debug('\n'+message);
-        self.extractCallId(message.toString(), function(err, callId) {
+        Protos.extractCallId(message.toString(), function(err, callId) {
             if(err) {
                 self.logger.error(err);
             }
-            self.logger.debug(callId);
+            self.emit(callId, message, remote);
         });
     });
 }
@@ -105,12 +110,11 @@ Protos.prototype.run = function() {
             self.logger.error(err);
         }
         else {
-            self.logger.info(JSON.stringify(replacements, undefined, 2));
             self.replacements = replacements;
             var server = dgram.createSocket('udp4');
             server.on('listening', function() {
                 if(_.isString(self.file)) {
-                    self.runSingleTestSuite(self.file, function(err) {
+                    self.runSingleTestSuite(self.file, false, function(err) {
                         if(err) {
                             self.logger.error(err);
                         }
@@ -120,11 +124,11 @@ Protos.prototype.run = function() {
                 else {
                     async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
                         var filename = 'testcases/'+(('0000000'+idx).slice(-7));
-                        self.runSingleTestSuite(filename, function(err) {
+                        self.runSingleTestSuite(filename, false, function(err) {
                             if(err) {
                                 self.logger.error(err);
                             }
-                            callback();
+                            setTimeout(callback, self.delay);
                         });
                     },
                     function(err, results) {
@@ -140,9 +144,17 @@ Protos.prototype.run = function() {
     });
 };
 
-Protos.prototype.runSingleTestSuite = function(file, callback) {
+Protos.prototype.runSingleTestSuite = function(file, runningValidation, callback) {
     var self = this;
     var tasks = [];
+    var fileName = path.basename(file);
+    var testNum;
+    if(/^[0-9]*$/.test(fileName)) {
+        testNum = parseInt(fileName, 10);
+    }
+    else {
+        testNum = 0;
+    }
     tasks.push(function(callback) {
         fs.readFile(file, callback);
     });
@@ -153,22 +165,41 @@ Protos.prototype.runSingleTestSuite = function(file, callback) {
         self.applyReplacements(initPayload, tdPayload, callback);
     });
     tasks.push(function(initPayload, tdPayload, callback) {
-        self.extractCallId(initPayload, function(err, callId) {
+        Protos.extractCallId(initPayload, function(err, callId) {
             callback(err, initPayload, tdPayload, callId);
         });
     });
     tasks.push(function(initPayload, tdPayload, callId, callback) {
-        var client = dgram.createSocket('udp4');
-        self.logger.debug('\n'+initPayload);
-        self.logger.debug(callId);
-        var initPayloadBuffer = new Buffer(initPayload);
-        client.send(initPayloadBuffer, 0, initPayloadBuffer.length, self.dport, self.dhost, function(err, bytes) {
-            setTimeout(function() {
-                client.close();
-                callback(err);
-            }, 10000);
+        self.logger.info("Sending Test-Case #"+testNum);
+        self.processSip(initPayload, callId, testNum, function(err) {
+            if(_.isObject(err) && _.isString(err.name) && err.name === "TimeoutError") {
+                callback(undefined, initPayload, tdPayload, callId);
+            }
+            else {
+                callback(err, initPayload, tdPayload, callId);
+            }
         });
     });
+    if(self.teardown) {
+        tasks.push(function(initPayload, tdPayload, callId, callback) {
+            self.logger.info(" Sending CANCEL");
+            self.processSip(tdPayload, callId, testNum, function(err) {
+                if(_.isObject(err) && _.isString(err.name) && err.name === "TimeoutError") {
+                    callback(undefined, initPayload, tdPayload, callId);
+                }
+                else {
+                    callback(err, initPayload, tdPayload, callId);
+                }
+            });
+        });
+    }
+    if(self.validcase && !runningValidation) {
+        tasks.push(function(initPayload, tdPayload, callId, callback) {
+            self.runSingleTestSuite('testcases/0000000', true, function(err) {
+                callback(err, initPayload, tdPayload, callId);
+            });
+        });
+    }
     async.waterfall(tasks, callback);
 };
 
@@ -187,7 +218,6 @@ Protos.prototype.readTC = function(data, callback) {
 };
 
 Protos.prototype.readTCSection = function(data, offset, callback) {
-    var self = this;
     var sizeString = "";
     var char;
     var charInt;
@@ -246,6 +276,12 @@ Protos.prototype.applyReplacements = function(initPayload, tdPayload, callback) 
             var tdSize = Protos.calcSize(tdPayload);
             tdPayload = tdPayload.replace(new RegExp('<Content-Length>', 'gm'), tdSize);
         }
+        if(initPayload.slice(-4) !== '\r\n\r\n') {
+            initPayload += '\r\n\r\n';
+        }
+        if(tdPayload.slice(-4) !== '\r\n\r\n') {
+            tdPayload += '\r\n\r\n';
+        }
         callback();
     });
     async.series(tasks, function(err) {
@@ -267,7 +303,9 @@ Protos.prototype.generateReplacements = function(callback) {
                 replacements["To-Pass"] = parsedToURI[2];
                 replacements["To-Host"] = parsedToURI[3];
                 replacements["To-Port"] = parsedToURI[4];
-                self.dhost = parsedToURI[3];
+                if(!_.isString(self.sendto)) {
+                    self.sendto = parsedToURI[3];
+                }
                 if(/^[0-9]*$/.test(replacements["To-Port"])) {
                     self.dport = parseInt(replacements["To-Port"], 10);
                 }
@@ -355,7 +393,7 @@ Protos.calcSize = function(msg) {
     }
     return 0;
 };
-Protos.prototype.extractCallId = function(msg, callback) {
+Protos.extractCallId = function(msg, callback) {
     var msgArr = msg.split('\r\n');
     async.detect(msgArr, function(line, callback) {
         callback(undefined, /^Call-ID:/i.test(line));
@@ -376,4 +414,103 @@ Protos.prototype.extractCallId = function(msg, callback) {
             }
         }
     });
+};
+Protos.extractResponse = function(msg) {
+    var statusRegex = /^SIP\/([0-9.]*) ([1-6][0-9]{2})( (.*))?$/;
+    var statusLine = _.first(msg.split('\r\n', 1)).trim();
+    if(statusRegex.test(statusLine)) {
+        var parsedStatus = statusLine.match(statusRegex);
+        return {
+            version: parsedStatus[1],
+            statusCode: parseInt(parsedStatus[2], 10),
+            statusMsg: parsedStatus[3]
+        };
+    }
+};
+
+Protos.prototype.processSip = function(payload, callId, testNum, callback) {
+    var self = this;
+    var method = Protos.extractMethod(payload);
+    callback = cb(callback).once().timeout(self.replywait);
+    self.on(callId, function(message, remote) {
+        var csMethod = Protos.extractCSeqMethod(message.toString());
+        if(csMethod === method || csMethod === "INVITE") {
+            var statusObj = Protos.extractResponse(message.toString());
+            if(_.isObject(statusObj) && _.isNumber(statusObj.statusCode)) {
+                self.logger.info("   Received Returncode: "+statusObj.statusCode);
+                switch(Math.floor(statusObj.statusCode/100)) {
+                    case 1:
+                    break;
+                    case 2:
+                    case 4:
+                    case 5:
+                        if(method === "INVITE") {
+                            self.removeAllListeners(callId);
+                            callback();
+                        }
+                        else if(method === "CANCEL") {
+                            var ackPayload = payload.replace(/CANCEL/gm, 'ACK');
+                            self.logger.info(" Sending ACK");
+                            self.sendMessage(ackPayload, testNum, function(err) {
+                                self.removeAllListeners(callId);
+                                callback(err);
+                            });
+                        }
+                    break;
+                    case 3:
+                    break;
+                    case 6:
+                    break;
+                    default:
+                        self.logger.error("Unknown status:"+statusObj.statusCode+" "+statusObj.statusMsg);
+                    break;
+                }
+            }
+        }
+    });
+    self.sendMessage(payload, testNum, function(err) {
+        if(err) {
+            callback(err);
+        }
+    });
+};
+
+Protos.prototype.sendMessage = function(payload, testNum, callback) {
+    var self = this;
+    var buf = Buffer.from(payload);
+    var bufsize = Math.min(payload.length, self.maxpdusize);
+    var client = dgram.createSocket({type: 'udp4', sendBufferSize: self.maxpdusize});
+    var truncBuf = Buffer.alloc(bufsize);
+    buf.copy(truncBuf, 0, 0, bufsize);
+    self.logger.debug(truncBuf.toString());
+    if(self.showsent) {
+        self.logger.info('\n'+hexdump(truncBuf));
+    }
+    client.send(truncBuf, 0, truncBuf.length, self.dport, self.sendto, function(err, bytes) {
+        self.logger.info("    test-case #"+testNum+", "+bytes+" bytes");
+        client.close();
+        callback(err);
+    });
+};
+
+Protos.extractMethod = function(payload) {
+    var firstLine = _.first(payload.split('/r/n'));
+    var methodRegex = /^(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|PRACK|SUBSCRIBE|NOTIFY|PUBLISH|INFO|REFER|MESSAGE|UPDATE)/i;
+    if(methodRegex.test(firstLine)) {
+        return firstLine.match(methodRegex)[1];
+    }
+    else {
+        return "UNKNOWN";
+    }
+};
+
+Protos.extractCSeqMethod = function(payload) {
+    var payloadArr = payload.split('\r\n');
+    var CSeqLine = _.find(payloadArr, function(line) {
+        return /^CSeq:/i.test(line);
+    });
+    var csmRegex = /(INVITE|ACK|BYE|CANCEL|REGISTER|OPTIONS|PRACK|SUBSCRIBE|NOTIFY|PUBLISH|INFO|REFER|MESSAGE|UPDATE)$/i;
+    if(csmRegex.test(CSeqLine)) {
+        return CSeqLine.match(csmRegex)[1];
+    }
 };
