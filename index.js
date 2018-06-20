@@ -6,6 +6,7 @@ var async = require('async');
 var ip = require('ip');
 var dns = require('dns');
 var uuid = require('node-uuid');
+var dgram = require('dgram');
 module.exports = Protos;
 
 function Protos(options, logger) {
@@ -30,6 +31,15 @@ function Protos(options, logger) {
         self.stop = self.single;
     }
     events.EventEmitter.call(this);
+    self.on('message', function(message, remote) {
+        self.logger.debug('\n'+message);
+        self.extractCallId(message.toString(), function(err, callId) {
+            if(err) {
+                self.logger.error(err);
+            }
+            self.logger.debug(callId);
+        });
+    });
 }
 
 Protos.super_ = events.EventEmitter;
@@ -97,26 +107,35 @@ Protos.prototype.run = function() {
         else {
             self.logger.info(JSON.stringify(replacements, undefined, 2));
             self.replacements = replacements;
-            if(_.isString(self.file)) {
-                self.runSingleTestSuite(self.file, function(err) {
-                    if(err) {
-                        self.logger.error(err);
-                    }
-                });
-            }
-            else {
-                async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
-                    var filename = 'testcases/'+(('0000000'+idx).slice(-7));
-                    self.runSingleTestSuite(filename, function(err) {
+            var server = dgram.createSocket('udp4');
+            server.on('listening', function() {
+                if(_.isString(self.file)) {
+                    self.runSingleTestSuite(self.file, function(err) {
                         if(err) {
                             self.logger.error(err);
                         }
-                        callback();
+                        server.close();
                     });
-                },
-                function(err, results) {
-                });
-            }
+                }
+                else {
+                    async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
+                        var filename = 'testcases/'+(('0000000'+idx).slice(-7));
+                        self.runSingleTestSuite(filename, function(err) {
+                            if(err) {
+                                self.logger.error(err);
+                            }
+                            callback();
+                        });
+                    },
+                    function(err, results) {
+                        server.close();
+                    });
+                }
+            });
+            server.on('message', function(message, remote) {
+                self.emit('message', message, remote);
+            });
+            server.bind(self.lport);
         }
     });
 };
@@ -134,9 +153,21 @@ Protos.prototype.runSingleTestSuite = function(file, callback) {
         self.applyReplacements(initPayload, tdPayload, callback);
     });
     tasks.push(function(initPayload, tdPayload, callback) {
-        self.logger.info("\n"+initPayload);
-        self.logger.info("\n"+tdPayload);
-        callback();
+        self.extractCallId(initPayload, function(err, callId) {
+            callback(err, initPayload, tdPayload, callId);
+        });
+    });
+    tasks.push(function(initPayload, tdPayload, callId, callback) {
+        var client = dgram.createSocket('udp4');
+        self.logger.debug('\n'+initPayload);
+        self.logger.debug(callId);
+        var initPayloadBuffer = new Buffer(initPayload);
+        client.send(initPayloadBuffer, 0, initPayloadBuffer.length, self.dport, self.dhost, function(err, bytes) {
+            setTimeout(function() {
+                client.close();
+                callback(err);
+            }, 10000);
+        });
     });
     async.waterfall(tasks, callback);
 };
@@ -236,6 +267,7 @@ Protos.prototype.generateReplacements = function(callback) {
                 replacements["To-Pass"] = parsedToURI[2];
                 replacements["To-Host"] = parsedToURI[3];
                 replacements["To-Port"] = parsedToURI[4];
+                self.dhost = parsedToURI[3];
                 if(/^[0-9]*$/.test(replacements["To-Port"])) {
                     self.dport = parseInt(replacements["To-Port"], 10);
                 }
@@ -322,4 +354,26 @@ Protos.calcSize = function(msg) {
         return size;
     }
     return 0;
+};
+Protos.prototype.extractCallId = function(msg, callback) {
+    var msgArr = msg.split('\r\n');
+    async.detect(msgArr, function(line, callback) {
+        callback(undefined, /^Call-ID:/i.test(line));
+    },
+    function(err, result) {
+        if(err) {
+            callback(err);
+        }
+        else {
+            var cidRegex = /^Call-ID:(.*)$/;
+            if(_.isString(result) && cidRegex.test(result)) {
+                var cid = result.replace(cidRegex, "$1");
+                cid = cid.trim();
+                callback(undefined, cid);
+            }
+            else {
+                callback(new Error("Could not find Call-ID in message"));
+            }
+        }
+    });
 };
