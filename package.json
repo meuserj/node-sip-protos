@@ -15,7 +15,11 @@
   "bugs": {
     "url": "https://github.com/meuserj/node-sip-protos/issues"
   },
+  "bin": {
+    "sip-protos": "./bin/sip-protos"
+  },
   "homepage": "https://github.com/meuserj/node-sip-protos#readme",
+  "preferGlobal": true,
   "dependencies": {
     "@buzuli/hexdump": "^1.1.0",
     "async": "^2.6.1",
