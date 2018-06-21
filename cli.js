@@ -16,6 +16,13 @@ exports.interpret = function(args) {
     }
     else {
         var protos = new Protos(options, cli);
-        protos.run();
+        protos.run(function(err, failedTests) {
+            if(err) {
+                cli.error(err);
+            }
+            if(_.isArray(failedTests) && !_.isEmpty(failedTests)) {
+                cli.info(failedTests);
+            }
+        });
     }
 };

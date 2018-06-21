@@ -71,7 +71,8 @@ Protos.options = {
     start:      [false, "Inject test-cases starting from <index>", "int", 0],
     stop:       [false, "Stop test-case injection at index", "int"],
     maxpdusize: ['m', "Maximum PDU size", "int", 65507],
-    validcase:  ['V', "Send valid case (case #0) after each test-case and wait for a response. May be used to check if the target is still responding.", "bool", false]
+    validcase:  ['V', "Send valid case (case #0) after each test-case and wait for a response. May be used to check if the target is still responding.", "bool", false],
+    exit:       ['x', "Exit if the validation check fails after any test"]
 };
 
 // I have three different loggers with slightly different functions available I
@@ -103,36 +104,44 @@ Protos.lastTestCase = function() {
     }
 };
 
-Protos.prototype.run = function() {
+Protos.prototype.run = function(callback) {
     var self = this;
+    var failedTests = [];
     self.generateReplacements(function(err, replacements) {
         if(err) {
-            self.logger.error(err);
+            callback(err);
         }
         else {
             self.replacements = replacements;
-            var server = dgram.createSocket('udp4');
+            var server = dgram.createSocket({type: 'udp4', recvBufferSize: self.maxpdusize});
             server.on('listening', function() {
                 if(_.isString(self.file)) {
-                    self.runSingleTestSuite(self.file, false, function(err) {
-                        if(err) {
-                            self.logger.error(err);
+                    self.runSingleTestSuite(self.file, false, function(err, passed) {
+                        if(passed === false) {
+                            failedTests.push(self.file);
                         }
                         server.close();
+                        callback(err, failedTests);
                     });
                 }
                 else {
                     async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
                         var filename = 'testcases/'+(('0000000'+idx).slice(-7));
-                        self.runSingleTestSuite(filename, false, function(err) {
-                            if(err) {
-                                self.logger.error(err);
+                        self.runSingleTestSuite(filename, false, function(err, passed) {
+                            if(passed === false) {
+                                failedTests.push(filename);
                             }
-                            setTimeout(callback, self.delay);
+                            if(err && self.exit) {
+                                callback(err);
+                            }
+                            else {
+                                setTimeout(callback, self.delay);
+                            }
                         });
                     },
                     function(err, results) {
                         server.close();
+                        callback(err, failedTests);
                     });
                 }
             });
@@ -149,6 +158,12 @@ Protos.prototype.runSingleTestSuite = function(file, runningValidation, callback
     var tasks = [];
     var fileName = path.basename(file);
     var testNum;
+    // validationFailed variable is set when we are running the validation step
+    // and is passed back to the nested call
+    var validationFailed = false;
+    // testPassed variable is set on the outer function run when we detect the
+    // inner validation step has failed.
+    var testPassed;
     if(/^[0-9]*$/.test(fileName)) {
         testNum = parseInt(fileName, 10);
     }
@@ -170,20 +185,33 @@ Protos.prototype.runSingleTestSuite = function(file, runningValidation, callback
         });
     });
     tasks.push(function(initPayload, tdPayload, callId, callback) {
-        self.logger.info("Sending Test-Case #"+testNum);
-        self.processSip(initPayload, callId, testNum, function(err) {
-            if(_.isObject(err) && _.isString(err.name) && err.name === "TimeoutError") {
+        if(runningValidation) {
+            self.logger.info("Sending valid-case");
+        }
+        else {
+            self.logger.info("Sending Test-Case #"+testNum);
+        }
+        self.processSip(initPayload, callId, testNum, function(err, statusObj) {
+            if(runningValidation) {
+                if(err || statusObj.statusCode !== 200) {
+                    validationFailed = true;
+                }
                 callback(undefined, initPayload, tdPayload, callId);
             }
             else {
-                callback(err, initPayload, tdPayload, callId);
+                if(_.isObject(err) && _.isString(err.name) && err.name === "TimeoutError") {
+                    callback(undefined, initPayload, tdPayload, callId);
+                }
+                else {
+                    callback(err, initPayload, tdPayload, callId);
+                }
             }
         });
     });
     if(self.teardown) {
         tasks.push(function(initPayload, tdPayload, callId, callback) {
             self.logger.info(" Sending CANCEL");
-            self.processSip(tdPayload, callId, testNum, function(err) {
+            self.processSip(tdPayload, callId, testNum, function(err, statusObj) {
                 if(_.isObject(err) && _.isString(err.name) && err.name === "TimeoutError") {
                     callback(undefined, initPayload, tdPayload, callId);
                 }
@@ -195,12 +223,38 @@ Protos.prototype.runSingleTestSuite = function(file, runningValidation, callback
     }
     if(self.validcase && !runningValidation) {
         tasks.push(function(initPayload, tdPayload, callId, callback) {
-            self.runSingleTestSuite('testcases/0000000', true, function(err) {
-                callback(err, initPayload, tdPayload, callId);
-            });
+            setTimeout(function() {
+                self.runSingleTestSuite('testcases/0000000', true, function(err) {
+                    if(err) {
+                        testPassed = false;
+                        if(self.exit) {
+                            callback(err, initPayload, tdPayload, callId);
+                        }
+                        else {
+                            callback(undefined, initPayload, tdPayload, callId);
+                        }
+                    }
+                    else {
+                        testPassed = true;
+                        callback(err, initPayload, tdPayload, callId);
+                    }
+                });
+            }, self.delay);
         });
     }
-    async.waterfall(tasks, callback);
+    async.waterfall(tasks, function(err) {
+        if(err) {
+            callback(err, false);
+        }
+        else if(runningValidation && validationFailed === true) {
+            var error = new Error("Test failed validation.");
+            error.code = "ValidationFailed";
+            callback(error);
+        }
+        else {
+            callback(undefined, testPassed);
+        }
+    });
 };
 
 Protos.prototype.readTC = function(data, callback) {
@@ -437,7 +491,7 @@ Protos.prototype.processSip = function(payload, callId, testNum, callback) {
         if(csMethod === method || csMethod === "INVITE") {
             var statusObj = Protos.extractResponse(message.toString());
             if(_.isObject(statusObj) && _.isNumber(statusObj.statusCode)) {
-                self.logger.info("   Received Returncode: "+statusObj.statusCode);
+                self.logger.info("   Received Returncode: "+statusObj.statusCode+" "+statusObj.statusMsg);
                 switch(Math.floor(statusObj.statusCode/100)) {
                     case 1:
                     break;
@@ -446,14 +500,14 @@ Protos.prototype.processSip = function(payload, callId, testNum, callback) {
                     case 5:
                         if(method === "INVITE") {
                             self.removeAllListeners(callId);
-                            callback();
+                            callback(undefined, statusObj);
                         }
                         else if(method === "CANCEL") {
                             var ackPayload = payload.replace(/CANCEL/gm, 'ACK');
                             self.logger.info(" Sending ACK");
                             self.sendMessage(ackPayload, testNum, function(err) {
                                 self.removeAllListeners(callId);
-                                callback(err);
+                                callback(err, statusObj);
                             });
                         }
                     break;
