@@ -8,7 +8,7 @@ var OPTIONS = Protos.options;
 exports.interpret = function(args) {
     cli.enable("help", "version", "status", "catchall");
     cli.option_width = 28;
-    cli.setApp(path.resolve('./package.json'));
+    cli.setApp(path.join(__dirname, "package.json"));
     cli.setArgv(args);
     var options = cli.parse(OPTIONS);
     if(!_.isString(options.touri)) {
