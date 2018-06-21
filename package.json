@@ -1,6 +1,6 @@
 {
   "name": "sip-protos",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A node implementation of the PROTOS SIP Fuzzing Test Suite",
   "main": "index.js",
   "scripts": {

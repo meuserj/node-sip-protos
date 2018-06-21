@@ -126,7 +126,7 @@ Protos.prototype.run = function(callback) {
                 }
                 else {
                     async.eachSeries(_.range(self.start, self.stop+1), function(idx, callback) {
-                        var filename = 'testcases/'+(('0000000'+idx).slice(-7));
+                        var filename = path.join(__dirname, 'testcases', (('0000000'+idx).slice(-7)));
                         self.runSingleTestSuite(filename, false, function(err, passed) {
                             if(passed === false) {
                                 failedTests.push(filename);
@@ -224,7 +224,7 @@ Protos.prototype.runSingleTestSuite = function(file, runningValidation, callback
     if(self.validcase && !runningValidation) {
         tasks.push(function(initPayload, tdPayload, callId, callback) {
             setTimeout(function() {
-                self.runSingleTestSuite('testcases/0000000', true, function(err) {
+                self.runSingleTestSuite(path.join(__dirname, 'testcases','0000000'), true, function(err) {
                     if(err) {
                         testPassed = false;
                         if(self.exit) {
